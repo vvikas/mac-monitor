@@ -9,17 +9,10 @@ func sysctl_int(_ key: String) -> Int {
     return value
 }
 
-// Thermal level (0–100+) is the real throttle indicator on Intel Macs.
-// The CPU throttles itself via PROCHOT/RAPL at hardware level before macOS
-// even lowers the P-state ceiling, so thermal level is more accurate.
-func thermalInfo() -> (level: Int, freqCeilMHz: Int, maxMHz: Int) {
-    let thermal  = sysctl_int("machdep.xcpm.cpu_thermal_level")
-    let bootMax  = sysctl_int("machdep.xcpm.bootpst")
-    let hardLim  = sysctl_int("machdep.xcpm.hard_plimit_max_100mhz_ratio")
-    return (thermal, hardLim * 100, bootMax * 100)
+func thermalLevel() -> Int {
+    sysctl_int("machdep.xcpm.cpu_thermal_level")
 }
 
-// Map thermal level → emoji + status text
 func thermalStatus(_ level: Int) -> (emoji: String, text: String) {
     switch level {
     case 0..<15:  return ("✅", "Cool — full speed")
@@ -30,26 +23,73 @@ func thermalStatus(_ level: Int) -> (emoji: String, text: String) {
     }
 }
 
-// Matches Activity Monitor: Used = active + wired + compressed
-func memInfo() -> (usedGB: Double, totalGB: Double, swapGB: Double) {
-    let total    = Double(ProcessInfo.processInfo.physicalMemory) / 1e9
-    var stats    = vm_statistics64()
-    var count    = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
-    let pageSize = Double(vm_kernel_page_size)
-    withUnsafeMutablePointer(to: &stats) {
-        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-            _ = host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+// CPU usage % across all cores via host_processor_info (no sudo needed)
+struct CPUUsage {
+    let user: Double    // user-space work
+    let system: Double  // kernel work
+    let idle: Double    // doing nothing
+    var active: Double { user + system }
+}
+
+var prevTicks: [Int32] = []
+
+func cpuUsage() -> CPUUsage {
+    var numCPUs: natural_t = 0
+    var cpuInfo: processor_info_array_t?
+    var numCPUInfo: mach_msg_type_number_t = 0
+
+    guard host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
+                               &numCPUs, &cpuInfo, &numCPUInfo) == KERN_SUCCESS,
+          let info = cpuInfo else {
+        return CPUUsage(user: 0, system: 0, idle: 100)
+    }
+
+    let stride = Int(CPU_STATE_MAX)
+    var totalUser: Int32 = 0
+    var totalSys:  Int32 = 0
+    var totalIdle: Int32 = 0
+    var totalAll:  Int32 = 0
+    var curTicks:  [Int32] = []
+
+    for i in 0..<Int(numCPUs) {
+        let base = i * stride
+        curTicks.append(info[base + Int(CPU_STATE_USER)])
+        curTicks.append(info[base + Int(CPU_STATE_SYSTEM)])
+        curTicks.append(info[base + Int(CPU_STATE_IDLE)])
+        curTicks.append(info[base + Int(CPU_STATE_NICE)])
+    }
+
+    if prevTicks.count == curTicks.count {
+        for i in 0..<Int(numCPUs) {
+            let base = i * stride
+            let dUser = curTicks[base]   - prevTicks[base]
+            let dSys  = curTicks[base+1] - prevTicks[base+1]
+            let dIdle = curTicks[base+2] - prevTicks[base+2]
+            let dNice = curTicks[base+3] - prevTicks[base+3]
+            totalUser += dUser + dNice
+            totalSys  += dSys
+            totalIdle += dIdle
+            totalAll  += dUser + dSys + dIdle + dNice
         }
     }
-    // active + wired + compressor = what Activity Monitor calls "Used"
-    let used = Double(stats.active_count + stats.wire_count + stats.compressor_page_count) * pageSize / 1e9
+    prevTicks = curTicks
+    vm_deallocate(mach_task_self_, vm_address_t(bitPattern: cpuInfo), vm_size_t(numCPUInfo) * vm_size_t(MemoryLayout<Int32>.size))
 
-    var swapUsage = xsw_usage()
-    var swapSize  = MemoryLayout<xsw_usage>.size
-    sysctlbyname("vm.swapusage", &swapUsage, &swapSize, nil, 0)
-    let swap = Double(swapUsage.xsu_used) / 1e9
+    guard totalAll > 0 else { return CPUUsage(user: 0, system: 0, idle: 100) }
+    let d = Double(totalAll)
+    return CPUUsage(
+        user:   Double(totalUser) / d * 100,
+        system: Double(totalSys)  / d * 100,
+        idle:   Double(totalIdle) / d * 100
+    )
+}
 
-    return (used, total, swap)
+// Visual heat bar e.g. [████████░░] 80/100
+func heatBar(_ level: Int) -> String {
+    let capped = min(level, 100)
+    let filled = capped / 10
+    let bar    = String(repeating: "█", count: filled) + String(repeating: "░", count: 10 - filled)
+    return "  [\(bar)] \(level)/100"
 }
 
 // ── app ───────────────────────────────────────────────────────────────────────
@@ -58,34 +98,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
     var menu: NSMenu!
 
-    // CPU items
-    let itemStatus   = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let itemLevel    = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let itemLevelBar = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let itemFreq     = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    // Memory items
-    let itemMem      = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let itemSwap     = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    // Footer
-    let itemUpdated  = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let itemStatus  = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let itemLevel   = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let itemBar     = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let itemCPU     = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let itemUpdated = NSMenuItem(title: "", action: nil, keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "── CPU Heat & Throttle ──", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "── CPU Monitor ──────────", action: nil, keyEquivalent: ""))
         menu.addItem(itemStatus)
         menu.addItem(itemLevel)
-        menu.addItem(itemLevelBar)
-        menu.addItem(itemFreq)
+        menu.addItem(itemBar)
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "── Memory ───────────────", action: nil, keyEquivalent: ""))
-        menu.addItem(itemMem)
-        menu.addItem(itemSwap)
+        menu.addItem(itemCPU)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(itemUpdated)
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit Mac Monitor", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         statusItem.menu = menu
         tick()
@@ -94,38 +126,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Visual heat bar e.g. [████████░░] 80
-    func heatBar(_ level: Int) -> String {
-        let capped = min(level, 100)
-        let filled = capped / 10
-        let empty  = 10 - filled
-        let bar    = String(repeating: "█", count: filled) + String(repeating: "░", count: empty)
-        return "  [\(bar)] \(level)/100"
-    }
-
     func tick() {
-        let cpu = thermalInfo()
-        let mem = memInfo()
-        let (emoji, text) = thermalStatus(cpu.level)
+        let level = thermalLevel()
+        let cpu   = cpuUsage()
+        let (emoji, text) = thermalStatus(level)
 
-        // ── menubar: just emoji + thermal level ───────────────
-        let label = "\(emoji) \(cpu.level)"
+        // menubar: emoji + thermal level + cpu usage
+        let label = "\(emoji) \(level)  CPU:\(Int(cpu.active))%"
         DispatchQueue.main.async {
             self.statusItem.button?.title = label
         }
 
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm:ss"
-        let timeStr = fmt.string(from: Date())
 
         DispatchQueue.main.async {
-            self.itemStatus.title   = "  \(emoji)  \(text)"
-            self.itemLevel.title    = "  Thermal level : \(cpu.level) / 100"
-            self.itemLevelBar.title = self.heatBar(cpu.level)
-            self.itemFreq.title     = "  Freq ceiling  : \(cpu.freqCeilMHz) MHz (max \(cpu.maxMHz) MHz)"
-            self.itemMem.title      = "  Used RAM  : \(String(format: "%.1f", mem.usedGB)) / \(String(format: "%.1f", mem.totalGB)) GB"
-            self.itemSwap.title     = "  Swap used : \(String(format: "%.2f", mem.swapGB)) GB"
-            self.itemUpdated.title  = "  Updated: \(timeStr)  (every 5s)"
+            self.itemStatus.title  = "  \(emoji)  \(text)"
+            self.itemLevel.title   = "  Thermal level : \(level) / 100"
+            self.itemBar.title     = heatBar(level)
+            self.itemCPU.title     = "  CPU usage     : \(Int(cpu.active))%  (usr \(Int(cpu.user))%  sys \(Int(cpu.system))%)"
+            self.itemUpdated.title = "  Updated: \(fmt.string(from: Date()))  (every 5s)"
         }
     }
 }
