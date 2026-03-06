@@ -9,17 +9,17 @@ func sysctl_int(_ key: String) -> Int {
     return value
 }
 
-// Thermal level (0–100+) is the REAL throttle indicator on Intel Macs.
-// The CPU throttles itself via PROCHOT/RAPL before macOS even lowers the
-// P-state ceiling, so thermal level is more accurate than freq ratio.
+// Thermal level (0–100+) is the real throttle indicator on Intel Macs.
+// The CPU throttles itself via PROCHOT/RAPL at hardware level before macOS
+// even lowers the P-state ceiling, so thermal level is more accurate.
 func thermalInfo() -> (level: Int, freqCeilMHz: Int, maxMHz: Int) {
-    let thermal     = sysctl_int("machdep.xcpm.cpu_thermal_level")
-    let bootMax     = sysctl_int("machdep.xcpm.bootpst")
-    let hardLim     = sysctl_int("machdep.xcpm.hard_plimit_max_100mhz_ratio")
+    let thermal  = sysctl_int("machdep.xcpm.cpu_thermal_level")
+    let bootMax  = sysctl_int("machdep.xcpm.bootpst")
+    let hardLim  = sysctl_int("machdep.xcpm.hard_plimit_max_100mhz_ratio")
     return (thermal, hardLim * 100, bootMax * 100)
 }
 
-// Map thermal level → human readable status + emoji
+// Map thermal level → emoji + status text
 func thermalStatus(_ level: Int) -> (emoji: String, text: String) {
     switch level {
     case 0..<15:  return ("✅", "Cool — full speed")
@@ -30,6 +30,7 @@ func thermalStatus(_ level: Int) -> (emoji: String, text: String) {
     }
 }
 
+// Matches Activity Monitor: Used = active + wired + compressed
 func memInfo() -> (usedGB: Double, totalGB: Double, swapGB: Double) {
     let total    = Double(ProcessInfo.processInfo.physicalMemory) / 1e9
     var stats    = vm_statistics64()
@@ -40,11 +41,14 @@ func memInfo() -> (usedGB: Double, totalGB: Double, swapGB: Double) {
             _ = host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
         }
     }
-    let used = Double(stats.active_count + stats.wire_count) * pageSize / 1e9
+    // active + wired + compressor = what Activity Monitor calls "Used"
+    let used = Double(stats.active_count + stats.wire_count + stats.compressor_page_count) * pageSize / 1e9
+
     var swapUsage = xsw_usage()
     var swapSize  = MemoryLayout<xsw_usage>.size
     sysctlbyname("vm.swapusage", &swapUsage, &swapSize, nil, 0)
     let swap = Double(swapUsage.xsu_used) / 1e9
+
     return (used, total, swap)
 }
 
@@ -90,13 +94,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Visual heat bar: e.g. [████████░░░░░░░░] 50
+    // Visual heat bar e.g. [████████░░] 80
     func heatBar(_ level: Int) -> String {
-        let capped   = min(level, 100)
-        let filled   = capped / 10        // 0–10 blocks
-        let empty    = 10 - filled
-        let bar      = String(repeating: "█", count: filled) + String(repeating: "░", count: empty)
-        return "  [\(bar)] \(level)"
+        let capped = min(level, 100)
+        let filled = capped / 10
+        let empty  = 10 - filled
+        let bar    = String(repeating: "█", count: filled) + String(repeating: "░", count: empty)
+        return "  [\(bar)] \(level)/100"
     }
 
     func tick() {
@@ -104,20 +108,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let mem = memInfo()
         let (emoji, text) = thermalStatus(cpu.level)
 
-        // ── menubar: emoji + thermal level + RAM ───────────────
-        let label = "\(emoji) Thermal:\(cpu.level) | RAM:\(String(format: "%.1f", mem.usedGB))GB"
+        // ── menubar: just emoji + thermal level ───────────────
+        let label = "\(emoji) \(cpu.level)"
         DispatchQueue.main.async {
             self.statusItem.button?.title = label
         }
 
-        // ── time of last update ────────────────────────────────
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm:ss"
         let timeStr = fmt.string(from: Date())
 
         DispatchQueue.main.async {
-            self.itemStatus.title   = "  \(emoji) \(text)"
-            self.itemLevel.title    = "  Thermal level : \(cpu.level) / 100  ← real throttle"
+            self.itemStatus.title   = "  \(emoji)  \(text)"
+            self.itemLevel.title    = "  Thermal level : \(cpu.level) / 100"
             self.itemLevelBar.title = self.heatBar(cpu.level)
             self.itemFreq.title     = "  Freq ceiling  : \(cpu.freqCeilMHz) MHz (max \(cpu.maxMHz) MHz)"
             self.itemMem.title      = "  Used RAM  : \(String(format: "%.1f", mem.usedGB)) / \(String(format: "%.1f", mem.totalGB)) GB"
