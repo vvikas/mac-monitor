@@ -1,0 +1,8 @@
+# Compiled binary
+MacMonitor
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
