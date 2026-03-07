@@ -131,8 +131,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let cpu   = cpuUsage()
         let (emoji, text) = thermalStatus(level)
 
-        // menubar: emoji + thermal level + cpu usage
-        let label = "\(emoji) \(level)  CPU:\(Int(cpu.active))%"
+        // menubar: just emoji + thermal level
+        let label = "\(emoji) \(level)"
         DispatchQueue.main.async {
             self.statusItem.button?.title = label
         }
@@ -149,6 +149,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 }
+
+// Enforce single instance — kill any existing process before starting
+let running = NSWorkspace.shared.runningApplications
+    .filter { $0.bundleIdentifier == nil && $0.executableURL?.lastPathComponent == "MacMonitor" }
+    .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+running.forEach { $0.terminate() }
 
 let app      = NSApplication.shared
 let delegate = AppDelegate()
