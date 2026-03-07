@@ -13,6 +13,33 @@ func thermalLevel() -> Int {
     sysctl_int("machdep.xcpm.cpu_thermal_level")
 }
 
+// Actual real-time CPU frequency via powermetrics (requires NOPASSWD sudo rule).
+// Parses "CPU Average frequency as fraction of nominal: XX% (YYY Mhz)"
+// Returns average across all cores in MHz, or nil if unavailable.
+func actualFreqMHz() -> Double? {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+    task.arguments = ["/usr/bin/powermetrics", "-n", "1", "-i", "400", "--samplers", "cpu_power"]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError  = Pipe()
+    do { try task.launch() } catch { return nil }
+    let data   = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: data, encoding: .utf8) ?? ""
+
+    // Collect all per-core MHz values and average them
+    let pattern = #"CPU Average frequency as fraction of nominal: [\d.]+ % \(([\d.]+) Mhz\)"#
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
+    let range   = NSRange(output.startIndex..., in: output)
+    let matches = regex.matches(in: output, range: range)
+    let freqs: [Double] = matches.compactMap { match in
+        guard let r = Range(match.range(at: 1), in: output) else { return nil }
+        return Double(output[r])
+    }
+    guard !freqs.isEmpty else { return nil }
+    return freqs.reduce(0, +) / Double(freqs.count)
+}
+
 func thermalStatus(_ level: Int) -> (emoji: String, text: String) {
     switch level {
     case 0..<15:  return ("✅", "Cool — full speed")
@@ -101,6 +128,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let itemStatus  = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let itemLevel   = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let itemBar     = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let itemFreq    = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let itemCPU     = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let itemUpdated = NSMenuItem(title: "", action: nil, keyEquivalent: "")
 
@@ -112,6 +140,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(itemStatus)
         menu.addItem(itemLevel)
         menu.addItem(itemBar)
+        menu.addItem(itemFreq)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(itemCPU)
         menu.addItem(NSMenuItem.separator())
@@ -131,21 +160,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let cpu   = cpuUsage()
         let (emoji, text) = thermalStatus(level)
 
-        // menubar: just emoji + thermal level
-        let label = "\(emoji) \(level)"
-        DispatchQueue.main.async {
-            self.statusItem.button?.title = label
-        }
+        // Fetch actual frequency in background (powermetrics takes ~400ms)
+        DispatchQueue.global(qos: .utility).async {
+            let freq = actualFreqMHz()
+            let freqStr = freq.map { String(format: "%.0f MHz", $0) } ?? "N/A"
 
-        let fmt = DateFormatter()
-        fmt.dateFormat = "HH:mm:ss"
+            let fmt = DateFormatter()
+            fmt.dateFormat = "HH:mm:ss"
+            let label = "\(emoji) \(level)"
 
-        DispatchQueue.main.async {
-            self.itemStatus.title  = "  \(emoji)  \(text)"
-            self.itemLevel.title   = "  Thermal level : \(level) / 100"
-            self.itemBar.title     = heatBar(level)
-            self.itemCPU.title     = "  CPU usage     : \(Int(cpu.active))%  (usr \(Int(cpu.user))%  sys \(Int(cpu.system))%)"
-            self.itemUpdated.title = "  Updated: \(fmt.string(from: Date()))  (every 5s)"
+            DispatchQueue.main.async {
+                self.statusItem.button?.title = label
+                self.itemStatus.title  = "  \(emoji)  \(text)"
+                self.itemLevel.title   = "  Thermal level : \(level) / 100"
+                self.itemBar.title     = heatBar(level)
+                self.itemFreq.title    = "  CPU frequency : \(freqStr)  (avg across cores)"
+                self.itemCPU.title     = "  CPU usage     : \(Int(cpu.active))%  (usr \(Int(cpu.user))%  sys \(Int(cpu.system))%)"
+                self.itemUpdated.title = "  Updated: \(fmt.string(from: Date()))  (every 5s)"
+            }
         }
     }
 }
