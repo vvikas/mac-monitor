@@ -28,7 +28,7 @@ func actualFreqMHz() -> Double? {
     let output = String(data: data, encoding: .utf8) ?? ""
 
     // Collect all per-core MHz values and average them
-    let pattern = #"CPU Average frequency as fraction of nominal: [\d.]+ % \(([\d.]+) Mhz\)"#
+    let pattern = #"CPU Average frequency as fraction of nominal: [\d.]+% \(([\d.]+) Mhz\)"#
     guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
     let range   = NSRange(output.startIndex..., in: output)
     let matches = regex.matches(in: output, range: range)
